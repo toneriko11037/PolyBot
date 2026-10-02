@@ -50,11 +50,16 @@ class PriceFeed:
             except asyncio.CancelledError:
                 pass
 
-    def value_at_or_after(self, ts_ms: int) -> float | None:
+    def point_at_or_after(self, ts_ms: int) -> tuple[int, float] | None:
         candidates = [ts for ts in self.history if ts >= ts_ms]
         if not candidates:
             return None
-        return self.history[min(candidates)]
+        ts = min(candidates)
+        return ts, self.history[ts]
+
+    def value_at_or_after(self, ts_ms: int) -> float | None:
+        point = self.point_at_or_after(ts_ms)
+        return point[1] if point else None
 
     def earliest_ts(self) -> int | None:
         return min(self.history) if self.history else None

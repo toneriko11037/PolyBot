@@ -50,6 +50,10 @@ class MultiPriceFeed:
         feed = self.feeds.get(asset.lower())
         return feed.latest_value if feed else None
 
+    def point_at_or_after(self, asset: str, ts_ms: int) -> tuple[int, float] | None:
+        feed = self.feeds.get(asset.lower())
+        return feed.point_at_or_after(ts_ms) if feed else None
+
     def value_at_or_after(self, asset: str, ts_ms: int) -> float | None:
         feed = self.feeds.get(asset.lower())
         return feed.value_at_or_after(ts_ms) if feed else None

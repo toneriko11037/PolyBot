@@ -44,7 +44,13 @@ SNAPSHOT_LOG_INTERVAL = 15.0
 DCA_CHECK_INTERVAL = 2.0
 SETTLE_CHECK_INTERVAL = 10.0
 SETTLE_DELAY = 15.0
-SETTLE_MAX_WAIT = 300.0
+# Gamma 结算有延迟，留 15 分钟正常等待窗口；超过后转入待结算队列继续轮询，
+# 不再占用风控额度。再超过 SETTLE_ABANDON_WAIT 才放弃记录。
+SETTLE_MAX_WAIT = 900.0
+SETTLE_ABANDON_WAIT = 3600.0
+# 收盘后若 Gamma 未出结果，用本地行情近似：取 end_ts 之后的第一个 tick，
+# 但若距收盘超过该容差（掉线/断流）则视为不可用，宁可不判。
+LOCAL_SETTLE_TOLERANCE_MS = 15000
 BTC_HOUR_SECONDS = 3600.0
 
 TRADES_CSV = "trades.csv"
@@ -66,6 +72,7 @@ TRADE_FIELDS = [
     "up_count",
     "down_count",
     "target",
+    "settled_by",
 ]
 
 
@@ -118,6 +125,9 @@ class Position:
     fills: int = 0
     last_attempt: float = 0.0
     closed: bool = False
+    pending: bool = False
+    settled: bool = False
+    settled_by: str = ""
     won: bool | None = None
     pnl: float = 0.0
     entry_ts: float = 0.0
@@ -498,31 +508,89 @@ class ConstellationBot:
             if pos.closed or now < pos.end_ts + SETTLE_DELAY:
                 continue
             won = gamma_market.fetch_outcome(pos.round_start, asset=pos.asset)
-            if won is None:
-                if now > pos.end_ts + SETTLE_MAX_WAIT:
-                    pos.closed = True
-                    order_log.warning(
-                        "%s 结算超时: %s %s 未取到结果，放弃记录",
-                        self._tag(),
-                        pos.asset.upper(),
-                        pos.side,
-                    )
+            if won is not None:
+                self._finalize(pos, won, now, source="gamma")
                 continue
-            pos.won = won if pos.side == "Up" else not won
-            payout = pos.shares if pos.won else 0.0
-            pos.pnl = payout - pos.spent
-            pos.closed = True
+            # Gamma 尚未出结果（通常有延迟）：先用本地行情近似落账，
+            # 后台继续轮询官方结果，出来后若不一致再补一条修正记录。
+            age = now - pos.end_ts
+            if not pos.settled:
+                local = self._local_outcome(pos)
+                if local is not None:
+                    self._finalize(pos, local, now, source="local")
+                    pos.pending = True  # 已判定，释放风控额度，但仍等官方确认
+                    continue
+            if age > SETTLE_ABANDON_WAIT:
+                pos.closed = True
+                order_log.warning(
+                    "%s 结算放弃: %s %s 超过 %.0fs 仍未取到官方结果%s",
+                    self._tag(),
+                    pos.asset.upper(),
+                    pos.side,
+                    SETTLE_ABANDON_WAIT,
+                    "（保留本地近似记录）" if pos.settled else "，且无法本地近似，放弃记录",
+                )
+            elif not pos.pending and age > SETTLE_MAX_WAIT:
+                pos.pending = True
+                order_log.warning(
+                    "%s 结算延迟: %s %s 超过 %.0fs 未出结果，转入待结算队列"
+                    "（不再占用风控额度，后台继续轮询）",
+                    self._tag(),
+                    pos.asset.upper(),
+                    pos.side,
+                    SETTLE_MAX_WAIT,
+                )
+
+    def _local_outcome(self, pos: Position) -> bool | None:
+        """用本地行情近似窗口结算：返回 Up 是否获胜；不可用时返回 None。
+
+        价格源为 chainlink_twap 时即官方结算源；取 end_ts 之后的第一个 tick，
+        距收盘超过容差（断流）则视为不可用。
+        """
+        if pos.target in (None, 0):
+            return None
+        end_ms = int(pos.end_ts * 1000)
+        point = self.feed.point_at_or_after(pos.asset, end_ms)
+        if point is None:
+            return None
+        tick_ms, final = point
+        if tick_ms - end_ms > LOCAL_SETTLE_TOLERANCE_MS:
+            return None
+        return final >= pos.target
+
+    def _finalize(self, pos: Position, won_up: bool, now: float, source: str) -> None:
+        won = won_up if pos.side == "Up" else not won_up
+        prev = pos.won if pos.settled else None
+        pos.won = won
+        pos.pnl = (pos.shares if won else 0.0) - pos.spent
+        pos.settled = True
+        pos.settled_by = source
+        pos.closed = source == "gamma"
+
+        if prev is not None and prev == won:
+            return  # 官方结果与本地近似一致，无需重复记录
+        if prev is not None:
             order_log.warning(
-                "%s 结算: %s %s | %s | 支出 $%.2f 收回 $%.2f | P&L $%+.2f",
+                "%s 结算修正: %s %s | 本地近似 %s → 官方 %s",
                 self._tag(),
                 pos.asset.upper(),
                 pos.side,
-                "WIN" if pos.won else "LOSE",
+                "WIN" if prev else "LOSE",
+                "WIN" if won else "LOSE",
+            )
+        else:
+            order_log.warning(
+                "%s 结算(%s): %s %s | %s | 支出 $%.2f 收回 $%.2f | P&L $%+.2f",
+                self._tag(),
+                source,
+                pos.asset.upper(),
+                pos.side,
+                "WIN" if won else "LOSE",
                 pos.spent,
-                payout,
+                pos.shares if won else 0.0,
                 pos.pnl,
             )
-            self._write_trade_csv(pos, now)
+        self._write_trade_csv(pos, now)
 
     def _write_trade_csv(self, pos: Position, settle_ts: float) -> None:
         path = Path(config.BASE_DIR) / ccfg.LOG_DIR / TRADES_CSV
@@ -545,6 +613,7 @@ class ConstellationBot:
             "up_count": pos.up_count,
             "down_count": pos.down_count,
             "target": f"{pos.target:.6g}",
+            "settled_by": pos.settled_by,
         }
         with path.open("a", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=TRADE_FIELDS)
@@ -554,7 +623,9 @@ class ConstellationBot:
 
     # -- risk / helpers ------------------------------------------------------
     def _open_positions(self) -> list[Position]:
-        return [p for p in self.positions.values() if not p.closed]
+        return [
+            p for p in self.positions.values() if not p.closed and not p.pending
+        ]
 
     def _open_count(self) -> int:
         return len(self._open_positions())

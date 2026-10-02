@@ -170,10 +170,16 @@ $10.50）。对 $250 账户来说，一笔会放大到 $10.50、三笔满仓 $31
 结算日志示例：
 
 ```
-[LIVE] 结算: BNB Up | WIN | 支出 $5.00 收回 $9.80 | P&L $+4.80
+[LIVE] 结算(gamma): BNB Up | WIN | 支出 $5.00 收回 $9.80 | P&L $+4.80
+[LIVE] 结算(local): ETH Down | LOSE | 支出 $5.00 收回 $0.00 | P&L $-5.00
+[LIVE] 结算修正: ETH Down | 本地近似 LOSE → 官方 LOSE
 ```
 
-- 胜负从 Gamma 已关闭市场读取（`gamma_market.fetch_outcome`）。
+- 胜负优先从 Gamma 已关闭市场读取（`gamma_market.fetch_outcome`）。
+- Gamma 结算有延迟：收盘 15s 后若仍无结果，先用本地行情近似（`_local_outcome`，取
+  `end_ts` 后第一个 tick；`PRICE_SOURCE=chainlink_twap` 时即官方结算源）。近似记录
+  `settled_by=local`，并释放风控额度；官方结果出来后若不一致，再补一条
+  `settled_by=gamma` 的修正行。统计时按 `窗口+资产` 取 `gamma` 行优先去重。
 - P&L = 结算收回 − 实际盘口支出（含滑点影响），**不估算、用真实成交价折算的份额**。
 
 ---
