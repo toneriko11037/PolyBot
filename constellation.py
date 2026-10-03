@@ -894,16 +894,23 @@ class ConstellationBot:
         if not cand.asset:
             return
         value = self._close_value(cand.asset, cand.end_ts)
+        # 记录候选时若行情流尚未就绪，target 可能为空；这里用窗口开盘价回填，
+        # 否则该候选永远无法判定胜负（up_won 一直为空，无法离线评估）。
+        target = cand.target
+        if target in (None, 0):
+            target = self.feed.value_at_or_after(cand.asset, cand.round_start * 1000)
+            if target is not None:
+                cand.target = target
         if value is not None:
             cand.final_value = value
-            if cand.target not in (None, 0):
-                cand.final_delta_pct = (value - cand.target) / cand.target * 100.0
+            if target not in (None, 0):
+                cand.final_delta_pct = (value - target) / target * 100.0
         won = gamma_market.fetch_outcome(cand.round_start, asset=cand.asset)
         if won is not None:
             cand.up_won = won
             cand.settled_by = "gamma"
-        elif value is not None and cand.target not in (None, 0):
-            cand.up_won = value >= cand.target
+        elif value is not None and target not in (None, 0):
+            cand.up_won = value >= target
             cand.settled_by = "local"
 
     def _write_candidate_csv(self, cand: Candidate, now: float) -> None:

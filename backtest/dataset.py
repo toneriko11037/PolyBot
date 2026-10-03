@@ -32,8 +32,16 @@ class Series:
         return self.open[j] if j >= 0 else None
 
     def close_before(self, t: float) -> float | None:
-        """t 时刻已收盘的最后一根 K 线的收盘价（严格早于 t，避免未来函数）。"""
-        i = bisect.bisect_left(self.ts, t)
+        """t 时刻已收盘的最后一根 K 线的收盘价（收盘时间严格 <= t，避免未来函数）。
+
+        注意：K 线 `ts` 是 open_time，因此 open_time 落在 (t-interval, t) 的 K 线
+        要到 open_time+interval（可能晚于 t）才收盘，不能使用——否则回测会偷看
+        最多一个 interval 的未来现货价。
+        """
+        if not self.ts:
+            return None
+        interval = self.ts[1] - self.ts[0] if len(self.ts) > 1 else 60
+        i = bisect.bisect_right(self.ts, t - interval)
         if i == 0:
             return None
         return self.close[i - 1]
