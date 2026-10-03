@@ -69,16 +69,93 @@ TRADE_FIELDS = [
     "pnl",
     "fills",
     "laggard_delta_pct",
+    "laggard_gap",
+    "leader_avg_price",
+    "opposite_price",
+    "entry_elapsed",
+    "btc_hour_pct",
     "up_count",
     "down_count",
+    "up_required",
+    "down_required",
+    "reversion_applied",
     "target",
+    "final_value",
+    "final_delta_pct",
+    "settled_by",
+]
+
+# 逐笔成交明细（每笔立即落盘，避免进程中断丢失）。
+FILLS_CSV = "trades_fills.csv"
+FILL_FIELDS = [
+    "fill_time",
+    "round_start",
+    "asset",
+    "side",
+    "level",
+    "price",
+    "amount",
+    "shares",
+    "cum_spent",
+]
+
+# 候选日志：每个窗口一行（无论是否开仓），用于离线研究过滤阈值。
+CANDIDATES_CSV = "candidates.csv"
+CANDIDATE_FIELDS = [
+    "round_start",
+    "end_time",
+    "btc_hour_pct",
+    "up_count",
+    "down_count",
+    "up_required",
+    "down_required",
+    "reversion_applied",
+    "consensus",
+    "candidate_asset",
+    "candidate_side",
+    "candidate_delta_pct",
+    "candidate_gap",
+    "leader_avg_price",
+    "candidate_price",
+    "opposite_price",
+    "in_band",
+    "decision",
+    "entered",
+    "target",
+    "up_won",
+    "final_value",
+    "final_delta_pct",
     "settled_by",
 ]
 
 
+def _log_dir() -> Path:
+    """模式感知的日志目录：DRY_RUN 时放到 `logs/dry/`，与实盘数据隔离。"""
+    base = Path(config.BASE_DIR if hasattr(config, "BASE_DIR") else ".") / ccfg.LOG_DIR
+    if ccfg.DRY_RUN:
+        base = base / "dry"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _rotate_csv_if_schema_changed(path: Path, fields: list[str]) -> None:
+    """表头与当前字段不一致时，把旧文件改名保留，另起新文件（避免列错位）。"""
+    if not path.exists():
+        return
+    try:
+        with path.open(encoding="utf-8-sig") as fh:
+            header = fh.readline().strip()
+    except OSError:
+        return
+    if header == ",".join(fields):
+        return
+    legacy = path.with_name(f"{path.stem}.legacy-{int(time.time())}{path.suffix}")
+    path.replace(legacy)
+    log.warning("CSV 表头已变更，旧文件保留为 %s", legacy.name)
+
+
 def setup_logging() -> None:
-    log_dir = Path(config.BASE_DIR if hasattr(config, "BASE_DIR") else ".") / ccfg.LOG_DIR
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = _log_dir()
     level = getattr(logging, ccfg.LOG_LEVEL, logging.INFO)
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)-11s | %(message)s",
@@ -119,6 +196,16 @@ class Position:
     target: float
     delta_pct: float
     entry_price: float
+    laggard_gap: float = 0.0
+    leader_avg_price: float = 0.0
+    opposite_price: float = 0.0
+    entry_elapsed: float = 0.0
+    btc_hour_pct: float | None = None
+    up_required: int = 0
+    down_required: int = 0
+    reversion_applied: bool = False
+    final_value: float | None = None
+    final_delta_pct: float | None = None
     spent: float = 0.0
     shares: float = 0.0
     levels: set[int] = field(default_factory=set)
@@ -135,6 +222,36 @@ class Position:
     down_count: int = 0
 
 
+@dataclass
+class Candidate:
+    """某个窗口的候选快照（无论最终是否开仓）。"""
+
+    round_start: int
+    end_ts: float
+    btc_hour_pct: float | None
+    up_count: int
+    down_count: int
+    up_required: int
+    down_required: int
+    reversion_applied: bool
+    consensus: str
+    asset: str
+    side: str
+    delta_pct: float | None
+    gap: float | None
+    leader_avg_price: float | None
+    price: float | None
+    opposite_price: float | None
+    in_band: bool
+    decision: str
+    entered: bool
+    target: float | None
+    up_won: bool | None = None
+    final_value: float | None = None
+    final_delta_pct: float | None = None
+    settled_by: str = ""
+
+
 class ConstellationBot:
     def __init__(self, feed: MultiPriceFeed, client) -> None:
         self.feed = feed
@@ -144,6 +261,7 @@ class ConstellationBot:
         self.round_start: int | None = None
         self.end_ts: float = 0.0
         self.positions: dict[tuple[int, str], Position] = {}
+        self.candidates: dict[tuple[int, str], Candidate] = {}
         self._attempts: dict[tuple[int, str], int] = {}
         self._last_scan = 0.0
         self._last_dca = 0.0
@@ -361,11 +479,25 @@ class ConstellationBot:
         btc_hour = self.feed.change_pct_over("btc", BTC_HOUR_SECONDS) if "btc" in ccfg.ASSETS else None
         direction, up_count, down_count = self.strategy.consensus(snaps, btc_hour)
         if direction is None:
+            self._upsert_candidate(
+                direction=None, up_count=up_count, down_count=down_count,
+                btc_hour=btc_hour, decision="no_consensus",
+            )
             return
 
         priced = await self._priced_snapshots(snaps, direction)
+        pack_price = self.strategy.leader_pack_price(priced, direction)
+        raw = self.strategy.cheapest_laggard(priced, direction)
+        raw_price = raw.price_for(direction) if raw is not None else None
+        gap = (pack_price - raw_price) if (pack_price is not None and raw_price is not None) else None
         laggard = self.strategy.pick_laggard(priced, direction)
         if laggard is None:
+            self._upsert_candidate(
+                direction=direction, up_count=up_count, down_count=down_count,
+                btc_hour=btc_hour, laggard=raw, gap=gap, leader_avg=pack_price,
+                target=self._target(raw.symbol) if raw is not None else None,
+                decision="laggard_gap" if raw is not None else "no_laggard",
+            )
             self._throttled("no_laggard", 15.0, "有共识(%s)但无落后者", direction)
             return
         key = (self.round_start, laggard.symbol)
@@ -378,7 +510,13 @@ class ConstellationBot:
         if market is None:
             return
         price = laggard.price_for(direction)
+        target = self._target(laggard.symbol) or 0.0
         if not self.strategy.in_band(price):
+            self._upsert_candidate(
+                direction=direction, up_count=up_count, down_count=down_count,
+                btc_hour=btc_hour, laggard=laggard, gap=gap, leader_avg=pack_price,
+                price=price, target=target, in_band=False, decision="price_band",
+            )
             self._throttled(
                 "band",
                 15.0,
@@ -392,6 +530,11 @@ class ConstellationBot:
             return
 
         if not self._risk_ok(ccfg.DCA_START_USD):
+            self._upsert_candidate(
+                direction=direction, up_count=up_count, down_count=down_count,
+                btc_hour=btc_hour, laggard=laggard, gap=gap, leader_avg=pack_price,
+                price=price, target=target, in_band=True, decision="risk",
+            )
             self._throttled(
                 "risk",
                 15.0,
@@ -406,6 +549,11 @@ class ConstellationBot:
 
         required = market.min_size * price
         if ccfg.DCA_START_USD < required:
+            self._upsert_candidate(
+                direction=direction, up_count=up_count, down_count=down_count,
+                btc_hour=btc_hour, laggard=laggard, gap=gap, leader_avg=pack_price,
+                price=price, target=target, in_band=True, decision="min_order",
+            )
             self._throttled(
                 "min_order",
                 15.0,
@@ -420,6 +568,13 @@ class ConstellationBot:
             )
             return
 
+        opposite = "Down" if direction == "Up" else "Up"
+        opposite_price = await asyncio.to_thread(
+            clob_price.midpoint, market.token_for(opposite)
+        )
+        up_required, down_required = self.strategy.required_counts(btc_hour)
+        required_here = up_required if direction == "Up" else down_required
+
         pos = Position(
             round_start=self.round_start,
             end_ts=market.end_ts,
@@ -429,9 +584,17 @@ class ConstellationBot:
             condition_id=market.condition_id,
             tick_size=market.tick_size,
             neg_risk=market.neg_risk,
-            target=self._target(laggard.symbol) or 0.0,
+            target=target,
             delta_pct=laggard.delta_pct,
             entry_price=price,
+            laggard_gap=gap if gap is not None else 0.0,
+            leader_avg_price=pack_price or 0.0,
+            opposite_price=opposite_price or 0.0,
+            entry_elapsed=now - self.round_start,
+            btc_hour_pct=btc_hour,
+            up_required=up_required,
+            down_required=down_required,
+            reversion_applied=required_here < self.strategy.p.min_consensus,
             entry_ts=now,
             up_count=up_count,
             down_count=down_count,
@@ -442,6 +605,12 @@ class ConstellationBot:
             return
         self._record_fill(pos, ccfg.DCA_START_USD, price, now)
         self.positions[key] = pos
+        self._upsert_candidate(
+            direction=direction, up_count=up_count, down_count=down_count,
+            btc_hour=btc_hour, laggard=laggard, gap=gap, leader_avg=pack_price,
+            price=price, target=target, opposite_price=opposite_price,
+            in_band=True, decision="entered", entered=True,
+        )
         order_log.warning(
             "%s 建仓: %s %s | 落后者 Δ=%+.3f%% | 共识 U%d/D%d | 入场=%.3f | $%.2f",
             self._tag(),
@@ -452,6 +621,69 @@ class ConstellationBot:
             down_count,
             price,
             ccfg.DCA_START_USD,
+        )
+
+    def _upsert_candidate(
+        self,
+        *,
+        direction: str | None,
+        up_count: int,
+        down_count: int,
+        btc_hour: float | None,
+        laggard=None,
+        gap: float | None = None,
+        leader_avg: float | None = None,
+        price: float | None = None,
+        target: float | None = None,
+        opposite_price: float | None = None,
+        in_band: bool = False,
+        decision: str = "no_consensus",
+        entered: bool = False,
+    ) -> None:
+        """记录/更新候选快照；按 (窗口,资产) 保留 gap 更大的快照，开仓则强制覆盖。"""
+        asset = laggard.symbol if laggard is not None else ""
+        key = (self.round_start, asset)
+        cur = self.candidates.get(key)
+        if cur is not None and not entered:
+            if cur.entered:
+                return
+            if laggard is None:
+                return
+            if cur.asset and (gap is None or gap <= (cur.gap or 0.0)):
+                return
+        # 该窗口已有资产候选行时，不再写 no_consensus/no_laggard 汇总行；
+        # 反过来，一旦出现资产候选行就丢弃同窗口的汇总行，避免同窗重复。
+        if not asset and any(
+            a for r, a in self.candidates if r == self.round_start and a
+        ):
+            return
+        if asset:
+            self.candidates.pop((self.round_start, ""), None)
+        up_req, down_req = self.strategy.required_counts(btc_hour)
+        required_here = up_req if direction == "Up" else down_req
+        self.candidates[key] = Candidate(
+            round_start=self.round_start,
+            end_ts=self.end_ts,
+            btc_hour_pct=btc_hour,
+            up_count=up_count,
+            down_count=down_count,
+            up_required=up_req,
+            down_required=down_req,
+            reversion_applied=required_here < self.strategy.p.min_consensus,
+            consensus=direction or "",
+            asset=asset,
+            side=direction if laggard is not None else "",
+            delta_pct=laggard.delta_pct if laggard is not None else None,
+            gap=gap,
+            leader_avg_price=leader_avg,
+            price=price if price is not None else (
+                laggard.price_for(direction) if laggard is not None else None
+            ),
+            opposite_price=opposite_price,
+            in_band=in_band,
+            decision=decision,
+            entered=entered,
+            target=target,
         )
 
     # -- DCA -----------------------------------------------------------------
@@ -487,7 +719,7 @@ class ConstellationBot:
             if not await self._place(pos, step.amount, f"加仓#{step.level}"):
                 continue
             pos.levels.add(step.level)
-            self._record_fill(pos, step.amount, price, now)
+            self._record_fill(pos, step.amount, price, now, level=step.level)
             order_log.warning(
                 "%s 加仓: %s %s | 第 %d 步 $%.2f @ %.3f | 累计 $%.2f",
                 self._tag(),
@@ -540,6 +772,30 @@ class ConstellationBot:
                     pos.side,
                     SETTLE_MAX_WAIT,
                 )
+        for key, cand in list(self.candidates.items()):
+            if now < cand.end_ts + SETTLE_DELAY:
+                continue
+            self._resolve_candidate(cand)
+            self._write_candidate_csv(cand, now)
+            del self.candidates[key]
+
+    def _close_point_at(self, asset: str, end_ts: float) -> tuple[int, float] | None:
+        """收盘附近的行情点 (tick_ms, value)；距收盘超过容差（断流）返回 None。"""
+        end_ms = int(end_ts * 1000)
+        point = self.feed.point_at_or_after(asset, end_ms)
+        if point is None:
+            return None
+        tick_ms, _ = point
+        if tick_ms - end_ms > LOCAL_SETTLE_TOLERANCE_MS:
+            return None
+        return point
+
+    def _close_point(self, pos: Position) -> tuple[int, float] | None:
+        return self._close_point_at(pos.asset, pos.end_ts)
+
+    def _close_value(self, asset: str, end_ts: float) -> float | None:
+        point = self._close_point_at(asset, end_ts)
+        return point[1] if point is not None else None
 
     def _local_outcome(self, pos: Position) -> bool | None:
         """用本地行情近似窗口结算：返回 Up 是否获胜；不可用时返回 None。
@@ -549,14 +805,10 @@ class ConstellationBot:
         """
         if pos.target in (None, 0):
             return None
-        end_ms = int(pos.end_ts * 1000)
-        point = self.feed.point_at_or_after(pos.asset, end_ms)
+        point = self._close_point(pos)
         if point is None:
             return None
-        tick_ms, final = point
-        if tick_ms - end_ms > LOCAL_SETTLE_TOLERANCE_MS:
-            return None
-        return final >= pos.target
+        return point[1] >= pos.target
 
     def _finalize(self, pos: Position, won_up: bool, now: float, source: str) -> None:
         won = won_up if pos.side == "Up" else not won_up
@@ -566,6 +818,11 @@ class ConstellationBot:
         pos.settled = True
         pos.settled_by = source
         pos.closed = source == "gamma"
+        point = self._close_point(pos)
+        if point is not None:
+            pos.final_value = point[1]
+            if pos.target not in (None, 0):
+                pos.final_delta_pct = (point[1] - pos.target) / pos.target * 100.0
 
         if prev is not None and prev == won:
             return  # 官方结果与本地近似一致，无需重复记录
@@ -593,7 +850,8 @@ class ConstellationBot:
         self._write_trade_csv(pos, now)
 
     def _write_trade_csv(self, pos: Position, settle_ts: float) -> None:
-        path = Path(config.BASE_DIR) / ccfg.LOG_DIR / TRADES_CSV
+        path = _log_dir() / TRADES_CSV
+        _rotate_csv_if_schema_changed(path, TRADE_FIELDS)
         new_file = not path.exists()
         row = {
             "settle_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(settle_ts)),
@@ -610,13 +868,76 @@ class ConstellationBot:
             "pnl": f"{pos.pnl:.4f}",
             "fills": pos.fills,
             "laggard_delta_pct": f"{pos.delta_pct:.4f}",
+            "laggard_gap": f"{pos.laggard_gap:.4f}",
+            "leader_avg_price": f"{pos.leader_avg_price:.4f}",
+            "opposite_price": f"{pos.opposite_price:.4f}",
+            "entry_elapsed": f"{pos.entry_elapsed:.1f}",
+            "btc_hour_pct": "" if pos.btc_hour_pct is None else f"{pos.btc_hour_pct:.4f}",
             "up_count": pos.up_count,
             "down_count": pos.down_count,
+            "up_required": pos.up_required,
+            "down_required": pos.down_required,
+            "reversion_applied": int(pos.reversion_applied),
             "target": f"{pos.target:.6g}",
+            "final_value": "" if pos.final_value is None else f"{pos.final_value:.6g}",
+            "final_delta_pct": "" if pos.final_delta_pct is None else f"{pos.final_delta_pct:.4f}",
             "settled_by": pos.settled_by,
         }
         with path.open("a", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=TRADE_FIELDS)
+            if new_file:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _resolve_candidate(self, cand: Candidate) -> None:
+        """补全候选的结算结果：优先 Gamma 官方，否则本地收盘近似。"""
+        if not cand.asset:
+            return
+        value = self._close_value(cand.asset, cand.end_ts)
+        if value is not None:
+            cand.final_value = value
+            if cand.target not in (None, 0):
+                cand.final_delta_pct = (value - cand.target) / cand.target * 100.0
+        won = gamma_market.fetch_outcome(cand.round_start, asset=cand.asset)
+        if won is not None:
+            cand.up_won = won
+            cand.settled_by = "gamma"
+        elif value is not None and cand.target not in (None, 0):
+            cand.up_won = value >= cand.target
+            cand.settled_by = "local"
+
+    def _write_candidate_csv(self, cand: Candidate, now: float) -> None:
+        path = _log_dir() / CANDIDATES_CSV
+        _rotate_csv_if_schema_changed(path, CANDIDATE_FIELDS)
+        new_file = not path.exists()
+        row = {
+            "round_start": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cand.round_start)),
+            "end_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cand.end_ts)),
+            "btc_hour_pct": "" if cand.btc_hour_pct is None else f"{cand.btc_hour_pct:.4f}",
+            "up_count": cand.up_count,
+            "down_count": cand.down_count,
+            "up_required": cand.up_required,
+            "down_required": cand.down_required,
+            "reversion_applied": int(cand.reversion_applied),
+            "consensus": cand.consensus,
+            "candidate_asset": cand.asset.upper(),
+            "candidate_side": cand.side,
+            "candidate_delta_pct": "" if cand.delta_pct is None else f"{cand.delta_pct:.4f}",
+            "candidate_gap": "" if cand.gap is None else f"{cand.gap:.4f}",
+            "leader_avg_price": "" if cand.leader_avg_price is None else f"{cand.leader_avg_price:.4f}",
+            "candidate_price": "" if cand.price is None else f"{cand.price:.4f}",
+            "opposite_price": "" if cand.opposite_price is None else f"{cand.opposite_price:.4f}",
+            "in_band": int(cand.in_band),
+            "decision": cand.decision,
+            "entered": int(cand.entered),
+            "target": "" if cand.target in (None, 0) else f"{cand.target:.6g}",
+            "up_won": "" if cand.up_won is None else int(cand.up_won),
+            "final_value": "" if cand.final_value is None else f"{cand.final_value:.6g}",
+            "final_delta_pct": "" if cand.final_delta_pct is None else f"{cand.final_delta_pct:.4f}",
+            "settled_by": cand.settled_by,
+        }
+        with path.open("a", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=CANDIDATE_FIELDS)
             if new_file:
                 writer.writeheader()
             writer.writerow(row)
@@ -639,12 +960,41 @@ class ConstellationBot:
         return self._open_exposure() + extra <= ccfg.MAX_EXPOSURE_USD
 
     def _record_fill(
-        self, pos: Position, amount: float, price: float, now: float | None = None
+        self,
+        pos: Position,
+        amount: float,
+        price: float,
+        now: float | None = None,
+        level: int = 0,
     ) -> None:
         pos.spent += amount
         pos.shares += amount / price
         pos.fills += 1
         pos.last_attempt = time.time() if now is None else now
+        self._write_fill_csv(pos, level, price, amount, pos.last_attempt)
+
+    def _write_fill_csv(
+        self, pos: Position, level: int, price: float, amount: float, fill_ts: float
+    ) -> None:
+        path = _log_dir() / FILLS_CSV
+        _rotate_csv_if_schema_changed(path, FILL_FIELDS)
+        new_file = not path.exists()
+        row = {
+            "fill_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fill_ts)),
+            "round_start": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pos.round_start)),
+            "asset": pos.asset.upper(),
+            "side": pos.side,
+            "level": level,
+            "price": f"{price:.4f}",
+            "amount": f"{amount:.4f}",
+            "shares": f"{amount / price:.4f}",
+            "cum_spent": f"{pos.spent:.4f}",
+        }
+        with path.open("a", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=FILL_FIELDS)
+            if new_file:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _tag(self) -> str:
         return "[DRY]" if ccfg.DRY_RUN else "[LIVE]"

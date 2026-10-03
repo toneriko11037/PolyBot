@@ -22,7 +22,7 @@ if not exist ".env" (
 
 echo.
 echo [run] python constellation.py
-echo [info] see CONSTELLATION.md
+echo [info] see README.md
 echo ------------------------------------------------------------
 ".venv\Scripts\python.exe" constellation.py
 set "RC=%ERRORLEVEL%"

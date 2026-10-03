@@ -106,6 +106,32 @@ class ConstellationStrategy:
             return ("Up" if up_count >= down_count else "Down"), up_count, down_count
         return ("Up" if up_ok else "Down"), up_count, down_count
 
+    def leader_pack_price(
+        self, snaps: list[AssetSnapshot], direction: str
+    ) -> float | None:
+        """「跟风队伍」在共识方向上的平均盘口价；无有效价格返回 None。"""
+        if direction == "Up":
+            leaders = [s for s in snaps if s.delta_pct > self.p.move_pct]
+        else:
+            leaders = [s for s in snaps if s.delta_pct < -self.p.move_pct]
+        prices = [p for s in leaders if (p := s.price_for(direction)) is not None]
+        return sum(prices) / len(prices) if prices else None
+
+    def cheapest_laggard(
+        self, snaps: list[AssetSnapshot], direction: str
+    ) -> AssetSnapshot | None:
+        """不看 gap 门槛，返回未跟上队伍里盘口价最低者（用于候选日志）。"""
+        if direction == "Up":
+            laggards = [s for s in snaps if s.delta_pct <= self.p.move_pct]
+        else:
+            laggards = [s for s in snaps if s.delta_pct >= -self.p.move_pct]
+        candidates = [s for s in laggards if s.price_for(direction) is not None]
+        if not candidates:
+            return None
+        return min(
+            candidates, key=lambda s: (s.price_for(direction), abs(s.delta_pct))
+        )
+
     def pick_laggard(
         self, snaps: list[AssetSnapshot], direction: str
     ) -> AssetSnapshot | None:
@@ -116,18 +142,13 @@ class ConstellationStrategy:
         （取盘口价最低者）。无人掉队 / 缺少价格时返回 None。
         """
         if direction == "Up":
-            leaders = [s for s in snaps if s.delta_pct > self.p.move_pct]
             laggards = [s for s in snaps if s.delta_pct <= self.p.move_pct]
         else:
-            leaders = [s for s in snaps if s.delta_pct < -self.p.move_pct]
             laggards = [s for s in snaps if s.delta_pct >= -self.p.move_pct]
 
-        leader_prices = [
-            p for s in leaders if (p := s.price_for(direction)) is not None
-        ]
-        if not leader_prices:
+        pack_price = self.leader_pack_price(snaps, direction)
+        if pack_price is None:
             return None
-        pack_price = sum(leader_prices) / len(leader_prices)
 
         candidates = [
             s
