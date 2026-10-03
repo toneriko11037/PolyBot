@@ -59,7 +59,7 @@ Up/Down 盘：多数资产同向而动、却有**一个落后者**没跟上时�
 
 1. **共识扫描（T+90s 起）**
    各资产相对**本窗口开盘价**算涨跌幅：
-   - 涨 > `MOVE_PCT`（0.03%）→ 记「跟涨」
+   - 涨 > `MOVE_PCT`（当前 0.02%）→ 记「跟涨」
    - 跌 < -`MOVE_PCT` → 记「跟跌」
    - 同向数量 ≥ `MIN_CONSENSUS`（默认 4/6）才认为大盘有方向。
 2. **挑落后者（隐含概率差）**
@@ -116,7 +116,7 @@ PnL 几乎持平（+$3160 → +$3371）。0.10 仍会砍掉约七成成交、绝
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `MOVE_PCT` | 0.03 | 判定「跟涨/跟跌」的最小涨跌幅（%） |
+| `MOVE_PCT` | 0.03 | 判定「跟涨/跟跌」的最小涨跌幅（%）；当前 `.env` 用 0.02 |
 | `AVG_MOVE_PCT` | 0/0.05 | 跟风队伍平均涨幅门槛（官网 UP/DOWN threshold），0=关闭 |
 | `LAGGARD_GAP` | 0.15 | 落后者需比队伍均价低的隐含概率差 |
 | `MIN_CONSENSUS` | 4 | 开仓所需同向资产数 |
@@ -148,9 +148,9 @@ PnL 几乎持平（+$3160 → +$3371）。0.10 仍会砍掉约七成成交、绝
 在 `.env` 中已设置：
 
 ```ini
-# 信号：照官网 BALANCED 预设
+# 信号：照官网 BALANCED 预设（MOVE_PCT 例外，改为 0.02，见 STATUS.md §5）
 CONSTELLATION_MIN_CONSENSUS=4
-CONSTELLATION_MOVE_PCT=0.03
+CONSTELLATION_MOVE_PCT=0.02
 CONSTELLATION_MIN_AVG_MOVE_PCT=0.05
 CONSTELLATION_LAGGARD_GAP=0.15
 CONSTELLATION_ENTRY_MIN=0.42
@@ -168,8 +168,9 @@ CONSTELLATION_MAX_POSITIONS=3
 CONSTELLATION_MAX_EXPOSURE_USD=15
 ```
 
-> 以上与仓库中 `.env` 一致；`.env.example` 是"照抄官网 BALANCED（0.38–0.68、$5）"的模板，
-> 两者不同时以 `.env` 为准。
+> 以上为当前**本地** `.env` 的取值。`.env` 已被 `.gitignore` 忽略（**不入库**），改动不会随 git 提交；
+> `.env.example` 是"照抄官网 BALANCED（0.38–0.68、$5）"的模板。两者不同时以本地 `.env` 为准。
+> **注意**：本节需要手动与本地 `.env` 保持同步，否则会与实际配置漂移。
 
 **为什么关闭 DCA？** 官网默认是三步入场（首笔 $5 → 加仓 $3 → 加仓 $2.50，单笔上限
 $10.50）。改成一次性买入后：
@@ -315,7 +316,8 @@ python -m backtest.run constellation --assets btc,eth,sol,xrp,doge,bnb ^
 
 数据 2026-04-15 ~ 2026-10-01，约 48,952 轮，含 **1.56% taker 费 + $0.01 滑点**，
 **已修正现货未来函数**。「隐含概率差」选落后者 + BALANCED 预设（consensus=4, laggard gap 0.15），
-DCA 关、每笔 $5、`--step 10`：
+DCA 关、每笔 $5、`--step 10`。**此表以 `MOVE_PCT=0.03` 默认值为前提**（`MOVE_PCT` 单独对照见
+`STATUS.md` §5；当前 `.env` 已改 0.02）：
 
 | 配置 | 成交 | 胜率 | PnL | ROI | 回撤 |
 |---|---|---|---|---|---|

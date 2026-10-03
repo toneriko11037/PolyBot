@@ -8,15 +8,16 @@
 ## 0. 一句话现状
 
 Constellation 多资产（BTC/ETH/SOL/XRP/DOGE/BNB）5m 策略，跑 `DRY_RUN`。
-刚做完"回测可信度"审查：修了回测未来函数 bug、README 数字重跑；
-清理了重复的时间闸参数；`MOVE_PCT` 有一个稳定改进候选待决定。改动**尚未 commit**。
+刚做完"回测可信度"审查：修了回测未来函数 bug、README 数字重跑；清理了重复的时间闸参数；
+`MOVE_PCT` 已从 0.03 切到 **0.02**（本地 `.env`，不入库；README/STATUS 已同步）。
+bug 修复已 commit；文档改动待 commit。
 
 ## 1. 当前生效配置（以 `.env` 为准）
 
 | 项 | 值 |
 |---|---|
 | 共识 `MIN_CONSENSUS` | 4 |
-| `MOVE_PCT` | 0.03 |
+| `MOVE_PCT` | **0.02**（本地 `.env`，非 0.03） |
 | `MIN_AVG_MOVE_PCT` | 0.05 |
 | `LAGGARD_GAP` | 0.15 |
 | 入场价带 | 0.42 – 0.62 |
@@ -37,8 +38,8 @@ Constellation 多资产（BTC/ETH/SOL/XRP/DOGE/BNB）5m 策略，跑 `DRY_RUN`�
 
 - [x] `DCA_STOP_BEFORE_CLOSE` 90/110/130 对照已跑（见 §7）：90 与 110 基本打平，130 明显差。
 - [x] `MOVE_PCT` 分季度验证（见 §5）：**5/5 子区间 0.02 更优**。
-- [ ] **决定** 是否把 `.env` 切 `MOVE_PCT=0.02`、`DCA_STOP_BEFORE_CLOSE=90`。
-- [ ] 当前工作区改动 `git status` 未提交。
+- [x] **已切** `.env` → `MOVE_PCT=0.02`（2026-10-03）。`DCA_STOP_BEFORE_CLOSE` 维持 110（与 90 打平）。
+- [ ] 文档改动（README/STATUS）待 commit；观察切换后 dry 表现。
 
 ## 4. 已确认的结论（防止重复踩坑）
 
